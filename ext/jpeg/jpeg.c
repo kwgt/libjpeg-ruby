@@ -258,6 +258,7 @@ static const char* encoder_opts_keys[] = {
   "scale",                    // {rational} or {float}
   "dct_method",               // {str}
   "orientation"               // {integer}
+  "stride"                    // {integer}
 };
 
 static ID encoder_opts_ids[N(encoder_opts_keys)];
@@ -265,6 +266,7 @@ static ID encoder_opts_ids[N(encoder_opts_keys)];
 typedef struct {
   int format;
   int width;
+  int stride;
   int height;
 
   int data_size;
@@ -436,6 +438,7 @@ set_encoder_context(jpeg_encode_t* ptr, int wd, int ht, VALUE opt)
   int quality;
   int scale_num;
   int scale_denom;
+  int stride;
   int i;
 
   /*
@@ -587,10 +590,28 @@ set_encoder_context(jpeg_encode_t* ptr, int wd, int ht, VALUE opt)
   }
 
   /*
+   * eval stride option
+   */
+  switch (TYPE(opts[5])) {
+  case T_UNDEF:
+    stride = wd * components;
+    break;
+
+  case T_FIXNUM:
+    stride = FIX2INT(opts[5]);
+    break;
+
+  default:
+    ARGUMENT_ERROR("Unsupportd :stride option value.");
+  }
+
+
+  /*
    * set context
    */
   ptr->format    = format;
   ptr->width     = wd;
+  ptr->stride    = stride;
   ptr->height    = ht;
   ptr->data_size = data_size;
   ptr->array     = ALLOC_ARRAY();
@@ -673,7 +694,7 @@ rb_encoder_initialize(int argc, VALUE *argv, VALUE self)
   return Qtrue;
 }
 
-static int
+static void
 push_rows_yuv422(JSAMPROW rows, int wd, uint8_t* data, int nrow)
 {
   int size;
@@ -692,11 +713,9 @@ push_rows_yuv422(JSAMPROW rows, int wd, uint8_t* data, int nrow)
     rows += 6;
     data += 4;
   }
-
-  return (size * 2);
 }
 
-static int
+static void
 push_rows_rgb565(JSAMPROW rows, int wd, uint8_t* data, int nrow)
 {
   int size;
@@ -712,79 +731,69 @@ push_rows_rgb565(JSAMPROW rows, int wd, uint8_t* data, int nrow)
     rows += 3;
     data += 2;
   }
-
-  return (size * 2);
 }
 
-static int
+static void
 push_rows_comp3(JSAMPROW rows, int wd, uint8_t* data, int nrow)
 {
   int size;
 
   size = wd * nrow * 3;
   memcpy(rows, data, size);
-
-  return size;
 }
 
-static int
+static void
 push_rows_comp4(JSAMPROW rows, int wd, uint8_t* data, int nrow)
 {
   int size;
 
   size = wd * nrow * 4;
   memcpy(rows, data, size);
-
-  return size;
 }
 
 
 
-static int
+static void
 push_rows_grayscale(JSAMPROW rows, int wd, uint8_t* data, int nrow)
 {
   int size;
 
   size = wd * nrow;
   memcpy(rows, data, size);
-
-  return size;
 }
 
-static int
+static void
 push_rows(jpeg_encode_t* ptr, uint8_t* data, int nrow)
 {
   int ret;
 
   switch (ptr->format) {
   case FMT_YUV422:
-    ret = push_rows_yuv422(ptr->rows, ptr->width, data, nrow);
+    push_rows_yuv422(ptr->rows, ptr->width, data, nrow);
     break;
 
   case FMT_RGB565:
-    ret = push_rows_rgb565(ptr->rows, ptr->width, data, nrow);
+    push_rows_rgb565(ptr->rows, ptr->width, data, nrow);
     break;
 
   case FMT_YUV:
   case FMT_RGB:
   case FMT_BGR:
-    ret = push_rows_comp3(ptr->rows, ptr->width, data, nrow);
+    push_rows_comp3(ptr->rows, ptr->width, data, nrow);
     break;
 
   case FMT_RGB32:
   case FMT_BGR32:
-    ret = push_rows_comp4(ptr->rows, ptr->width, data, nrow);
+    push_rows_comp4(ptr->rows, ptr->width, data, nrow);
     break;
 
   case FMT_GRAYSCALE:
-    ret = push_rows_grayscale(ptr->rows, ptr->width, data, nrow);
+    push_rows_grayscale(ptr->rows, ptr->width, data, nrow);
     break;
 
   default:
     RUNTIME_ERROR("Really?");
   }
-
-  return ret;
 }
 
 static void
@@ -838,8 +847,10 @@ do_encode(jpeg_encode_t* ptr, uint8_t* data)
     nrow = ptr->cinfo.image_height - ptr->cinfo.next_scanline;
     if (nrow > UNIT_LINES) nrow = UNIT_LINES;
 
-    data += push_rows(ptr, data, nrow);
+    push_rows(ptr, data, nrow);
+
     jpeg_write_scanlines(&ptr->cinfo, ptr->array, nrow);
+    data += ptr->stride;
   }
 
   jpeg_finish_compress(&ptr->cinfo);
