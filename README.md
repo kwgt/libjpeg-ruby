@@ -50,7 +50,7 @@ IO.binwrite("test.bgr", raw)
 | :expand_colormap | Booblean | T.B.D |
 | :scale | Rational or Float | T.B.D |
 | :dct_method | String or Symbol | T.B.D |
-| :with_exif | Boolean | Specify whether to read Exif tag. When set to true, the content of Exif tag will included in the meta information. |
+| :with_exif_tags | Boolean | Specify whether to read Exif tag. When set to true, the content of Exif tag will included in the meta information. |
 | :orientation | Boolean | Specify whether to parse Exif orientation. When set to true, apply orientation for decode result. |
 
 #### supported output format
