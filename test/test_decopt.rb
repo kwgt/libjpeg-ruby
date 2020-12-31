@@ -527,18 +527,18 @@ class TestDecodeOptions < Test::Unit::TestCase
   # dither (normal)
   #
 
-  data("ordered"            => [:ORDERED, true, 64],
-       "floyd-steinberg"    => [:FS, false, 64],
-       "8 colors"           => [:FS, false, 8],
-       "16 colors"          => [:FS, false, 16],
-       "32 colors"          => [:FS, false, 32],
-       "128 colors"         => [:FS, false, 128],
-       "256 colors"         => [:FS, false, 256],
-       "8 colors (2pass)"   => [:FS, true, 8],
-       "16 colors (2pass)"  => [:FS, true, 16],
-       "32 colors (2pass)"  => [:FS, true, 32],
-       "128 colors (2pass)" => [:FS, true, 128],
-       "256 colors (2pass)" => [:FS, true, 256],
+  data("ordered"            => [:ORDERED, true,  64],
+       "floyd-steinberg"    => [:FS,      false, 64],
+       "8 colors"           => [:FS,      false, 8],
+       "16 colors"          => [:FS,      false, 16],
+       "32 colors"          => [:FS,      false, 32],
+       "128 colors"         => [:FS,      false, 128],
+       "256 colors"         => [:FS,      false, 256],
+       "8 colors (2pass)"   => [:FS,      true,  8],
+       "16 colors (2pass)"  => [:FS,      true,  16],
+       "32 colors (2pass)"  => [:FS,      true,  32],
+       "128 colors (2pass)" => [:FS,      true,  128],
+       "256 colors (2pass)" => [:FS,      true,  256],
       )
 
   test "dither (normal)" do |val|
@@ -548,8 +548,9 @@ class TestDecodeOptions < Test::Unit::TestCase
     }
 
     img = assert_nothing_raised {dec << TEST_DATA}
+    # write_ppm(img, val)
 
-    assert_equal(65536, img.size);
+    assert_equal(65536, img.bytesize);
     assert_kind_of(Array, img.meta.colormap);
     assert_true(val[2] >= img.meta.colormap.size);
 
@@ -687,15 +688,14 @@ class TestDecodeOptions < Test::Unit::TestCase
   # scale (normal)
   #
 
-  data("1/2"   => {:val => 1/2r,  :size => 128},
+  data("1"     => {:val => 1,     :size => 256},
+       "2"     => {:val => 2,     :size => 512},
+       "1/2"   => {:val => 1/2r,  :size => 128},
        "1/1"   => {:val => 1/1r,  :size => 256},
        "2/1"   => {:val => 2/1r,  :size => 512},
        "0.5"   => {:val => 0.5,   :size => 128},
        "1.0"   => {:val => 1.0,   :size => 256},
-       "2.0"   => {:val => 2.0,   :size => 512},
-       "[1,2]" => {:val => [1,2], :size => 128},
-       "[1,1]" => {:val => [1,1], :size => 256},
-       "[2,1]" => {:val => [2,1], :size => 512})
+       "2.0"   => {:val => 2.0,   :size => 512})
 
   test "scale (normal)" do |info|
     dec = assert_nothing_raised {
@@ -711,13 +711,14 @@ class TestDecodeOptions < Test::Unit::TestCase
   # scale (bad value)
   #
 
-  data("int"     => {:val => 1,       :exp => TypeError},
-       "true"    => {:val => true,    :exp => TypeError},
-       "false"   => {:val => false,   :exp => TypeError},
-       "hash"    => {:val => {},      :exp => TypeError},
-       "[]"      => {:val => [],      :exp => ArgumentError},
-       "[1,2,3]" => {:val => [1,2,3], :exp => ArgumentError},
-       "string"  => {:val => "2.0",   :exp => TypeError})
+  data("int(minus)" => {:val => -1,      :exp => RangeError},
+       "int(0)"     => {:val => 0,       :exp => RangeError},
+       "true"       => {:val => true,    :exp => TypeError},
+       "false"      => {:val => false,   :exp => TypeError},
+       "hash"       => {:val => {},      :exp => TypeError},
+       "[]"         => {:val => [],      :exp => TypeError},
+       "[1,2,3]"    => {:val => [1,2,3], :exp => TypeError},
+       "string"     => {:val => "2.0",   :exp => TypeError})
 
   test "scale (bad value)" do |info|
     assert_raise_kind_of(info[:exp]) {

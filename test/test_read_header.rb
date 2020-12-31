@@ -37,8 +37,7 @@ class TestReadHeader < Test::Unit::TestCase
   # read header (with Exif tags)
   #
 
-  data("currently" => :with_exif_tags,
-       "obsolete" => :with_exif)
+  data("currently" => :with_exif_tags)
 
   test "read header (with Exif tags)" do |opt|
     dec = JPEG::Decoder.new(opt => true)
@@ -104,8 +103,7 @@ class TestReadHeader < Test::Unit::TestCase
   # on decode (with Exif tags)
   #
 
-  data("currently" => :with_exif_tags,
-       "obsolete" => :with_exif)
+  data("currently" => :with_exif_tags)
 
   test "on decode (with Exif tags)" do |opt|
     dec = JPEG::Decoder.new(opt => true)
