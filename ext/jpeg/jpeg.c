@@ -23,18 +23,24 @@
 #define DEFAULT_QUALITY            75
 #define DEFAULT_INPUT_COLOR_SPACE  JCS_YCbCr
 #define DEFAULT_INPUT_COMPONENTS   2
-#define DEFAULT_FLAGS              (F_NEED_META)
+#define DEFAULT_ENCODE_FLAGS       (0)
+#define DEFAULT_DECODE_FLAGS       (F_NEED_META)
 
 #define F_NEED_META                0x00000001
 #define F_EXPAND_COLORMAP          0x00000002
 #define F_PARSE_EXIF               0x00000004
 #define F_APPLY_ORIENTATION        0x00000008
 #define F_DITHER                   0x00000010
+#define F_CREAT                    0x00010000
+#define F_START                    0x00020000
 
 #define SET_FLAG(ptr, msk)         ((ptr)->flags |= (msk))
 #define CLR_FLAG(ptr, msk)         ((ptr)->flags &= ~(msk))
 #define TEST_FLAG(ptr, msk)        ((ptr)->flags & (msk))
 #define TEST_FLAG_ALL(ptr, msk)    (((ptr)->flags & (msk)) == (msk))
+
+#define SET_DATA(ptr, dat)         ((ptr)->data = (dat))
+#define CLR_DATA(ptr)              ((ptr)->data = Qnil)
 
 #define FMT_YUV422                 1
 #define FMT_RGB565                 2
@@ -263,6 +269,14 @@ static const char* encoder_opts_keys[] = {
 static ID encoder_opts_ids[N(encoder_opts_keys)];
 
 typedef struct {
+  struct jpeg_error_mgr jerr;
+
+  char msg[JMSG_LENGTH_MAX+10];
+  jmp_buf jmpbuf;
+} ext_error_t;
+
+typedef struct {
+  int flags;
   int width;
   int stride;
   int height;
@@ -275,10 +289,12 @@ typedef struct {
   J_DCT_METHOD dct_method;
 
   struct jpeg_compress_struct cinfo;
-  struct jpeg_error_mgr jerr;
+  ext_error_t err_mgr;
 
   JSAMPARRAY array;
   JSAMPROW rows;
+
+  VALUE data;
 
   struct {
     unsigned char* mem;
@@ -303,19 +319,11 @@ static const char* decoder_opts_keys[] = {
   "expand_colormap",          // {bool}
   "scale",                    // {rational} or {float}
   "dct_method",               // {str}
-  "with_exif",                // {bool}
   "with_exif_tags",           // {bool}
   "orientation"               // {bool}
 };
 
 static ID decoder_opts_ids[N(decoder_opts_keys)];
-
-typedef struct {
-  struct jpeg_error_mgr jerr;
-
-  char msg[JMSG_LENGTH_MAX+10];
-  jmp_buf jmpbuf;
-} ext_error_t;
 
 typedef struct {
   int flags;
@@ -341,12 +349,17 @@ typedef struct {
   struct jpeg_decompress_struct cinfo;
   ext_error_t err_mgr;
 
+  JSAMPARRAY array;
+
+  VALUE data;
+
   struct {
     int value;
     VALUE buf;
   } orientation;
 } jpeg_decode_t;
 
+#if 0
 static VALUE
 create_runtime_error(const char* fmt, ...)
 {
@@ -359,6 +372,7 @@ create_runtime_error(const char* fmt, ...)
 
   return ret;
 }
+#endif
 
 static VALUE
 create_argument_error(const char* fmt, ...)
@@ -418,6 +432,48 @@ create_memory_error()
   return rb_exc_new_str(rb_eRangeError, rb_str_new_cstr("no memory"));
 }
 
+static void
+output_message(j_common_ptr cinfo)
+{
+  ext_error_t* err;
+
+  err = (ext_error_t*)cinfo->err;
+
+  (*err->jerr.format_message)(cinfo, err->msg);
+}
+
+static void
+emit_message(j_common_ptr cinfo, int msg_level)
+{
+  ext_error_t* err;
+
+  if (msg_level < 0) {
+    err = (ext_error_t*)cinfo->err;
+    (*err->jerr.format_message)(cinfo, err->msg);
+    /*
+     * 以前はemit_messageが呼ばれるとエラー扱いしていたが、
+     * Logicoolの一部のモデルなどで問題が出るので無視する
+     * ようにした。
+     * また本来であれば、警告表示を行うべきでもあるが一部
+     * のモデルで大量にemitされる場合があるので表示しない
+     * ようにしている。
+     * 問題が発生した際は、最後のメッセージをオブジェクト
+     * のインスタンスとして持たすべき。
+     */
+    // longjmp(err->jmpbuf, 1);
+  }
+}
+
+static void
+error_exit(j_common_ptr cinfo)
+{
+  ext_error_t* err;
+
+  err = (ext_error_t*)cinfo->err;
+  (*err->jerr.format_message)(cinfo, err->msg);
+  longjmp(err->jmpbuf, 1);
+}
+
 static VALUE
 lookup_tag_symbol(tag_entry_t* tbl, size_t n, int tag)
 {
@@ -459,24 +515,16 @@ lookup_tag_symbol(tag_entry_t* tbl, size_t n, int tag)
 }
 
 static void
-encode_output_message(j_common_ptr cinfo)
+rb_encoder_mark(void* _ptr)
 {
-  char msg[JMSG_LENGTH_MAX];
+  jpeg_encode_t* ptr;
 
-  (*cinfo->err->format_message)(cinfo, msg);
+  ptr = (jpeg_encode_t*)_ptr;
+
+  if (ptr->data != Qnil) {
+    rb_gc_mark(ptr->data);
+  }
 }
-
-static void
-encode_error_exit(j_common_ptr cinfo)
-{
-  char msg[JMSG_LENGTH_MAX];
-
-  (*cinfo->err->format_message)(cinfo, msg);
-
-  jpeg_destroy_compress((j_compress_ptr)cinfo);
-  rb_raise(encerr_klass, "%s", msg);
-}
-
 
 static void
 rb_encoder_free( void* _ptr)
@@ -497,7 +545,9 @@ rb_encoder_free( void* _ptr)
     free(ptr->buf.mem);
   }
 
-  jpeg_destroy_compress(&ptr->cinfo);
+  if (TEST_FLAG(ptr, F_START)) {
+    jpeg_destroy_compress(&ptr->cinfo);
+  }
 
   free(ptr);
 }
@@ -510,7 +560,9 @@ rb_encoder_alloc(VALUE self)
   ptr = ALLOC(jpeg_encode_t);
   memset(ptr, 0, sizeof(*ptr));
 
-  return Data_Wrap_Struct(encoder_klass, 0, rb_encoder_free, ptr);
+  ptr->flags = DEFAULT_ENCODE_FLAGS;
+
+  return Data_Wrap_Struct(encoder_klass, rb_encoder_mark, rb_encoder_free, ptr);
 }
 
 static VALUE
@@ -822,13 +874,16 @@ set_encoder_context(jpeg_encode_t* ptr, int wd, int ht, VALUE opt)
    * set the rest context parameter
    */
   if (!RTEST(ret)) {
-    ptr->data_size = ptr->stride * ptr->height;
+    ptr->err_mgr.jerr.output_message = output_message;
+    ptr->err_mgr.jerr.emit_message   = emit_message;
+    ptr->err_mgr.jerr.error_exit     = error_exit;
 
+    ptr->data_size = ptr->stride * ptr->height;
     ptr->buf.mem   = NULL;
     ptr->buf.size  = 0;
-
     ptr->array     = ary;
     ptr->rows      = rows;
+    ptr->data      = Qnil;
 
     for (i = 0; i < UNIT_LINES; i++) {
       ptr->array[i] = ptr->rows + (i * ptr->width * ptr->components);
@@ -840,11 +895,9 @@ set_encoder_context(jpeg_encode_t* ptr, int wd, int ht, VALUE opt)
    */
   if (!RTEST(ret)) {
     jpeg_create_compress(&ptr->cinfo);
+    SET_FLAG(ptr, F_CREAT);
 
-    ptr->cinfo.err              = jpeg_std_error(&ptr->jerr);
-    ptr->jerr.output_message    = encode_output_message;
-    ptr->jerr.error_exit        = encode_error_exit;
-
+    ptr->cinfo.err              = jpeg_std_error(&ptr->err_mgr.jerr);
     ptr->cinfo.image_width      = ptr->width;
     ptr->cinfo.image_height     = ptr->height;
     ptr->cinfo.in_color_space   = ptr->color_space;
@@ -1099,39 +1152,35 @@ put_exif_tags(jpeg_encode_t* ptr)
 }
 
 static VALUE
-do_encode(jpeg_encode_t* ptr, uint8_t* data)
+do_encode(VALUE _ptr)
 {
   VALUE ret;
+  jpeg_encode_t* ptr;
+  uint8_t* data;
   int nrow;
 
   /*
    * initialize
    */
-  ret = Qnil;
-
-  /*
-   * release already allocated memory
-   */
-  if (ptr->buf.mem != NULL) {
-    free(ptr->buf.mem);
-
-    ptr->buf.mem  = NULL;
-    ptr->buf.size = 0;
-  }
-
-  /*
-   * set destination
-   */
-  jpeg_mem_dest(&ptr->cinfo, &ptr->buf.mem, &ptr->buf.size); 
-  if (ptr->buf.mem == NULL) {
-    ret = create_runtime_error("jpeg_mem_dest() failed");
-  }
+  ret  = Qnil;
+  ptr  = (jpeg_encode_t*)_ptr;
+  data = (uint8_t*)RSTRING_PTR(ptr->data);
 
   /*
    * do encode
    */
-  if (!RTEST(ret)) {
+  if (setjmp(ptr->err_mgr.jmpbuf)) {
+    /*
+     * when error occurred
+     */
+    rb_raise(encerr_klass, "%s", ptr->err_mgr.msg);
+
+  } else {
+    /*
+     * normal path
+     */
     jpeg_start_compress(&ptr->cinfo, TRUE);
+    SET_FLAG(ptr, F_START);
 
     if (ptr->orientation != 0) {
       put_exif_tags(ptr);
@@ -1147,7 +1196,13 @@ do_encode(jpeg_encode_t* ptr, uint8_t* data)
       data += (ptr->stride * nrow);
     }
 
-    jpeg_finish_compress(&ptr->cinfo);
+    /*
+     * build return data
+     */
+    ret = rb_str_buf_new(ptr->buf.size);
+    rb_str_set_len(ret, ptr->buf.size);
+
+    memcpy(RSTRING_PTR(ret), ptr->buf.mem, ptr->buf.size);
   }
 
   return ret;
@@ -1166,71 +1221,85 @@ static VALUE
 rb_encoder_encode(VALUE self, VALUE data)
 {
   VALUE ret;
-  VALUE exc;
+  int state;
   jpeg_encode_t* ptr;
 
   /*
    * initialize
    */
-  ret = Qnil;
-  exc = Qnil;
+  ret   = Qnil;
+  state = 0;
 
   Data_Get_Struct(self, jpeg_encode_t, ptr);
 
   /*
    * argument check
    */
-  do {
-    if (TYPE(data) != T_STRING) {
-      exc = create_argument_error("invalid data");
-      break;
-    }
+  Check_Type(data, T_STRING);
 
-    if (RSTRING_LEN(data) < ptr->data_size) {
-      exc = create_argument_error("image data is too short");
-      break;
-    }
+  if (RSTRING_LEN(data) < ptr->data_size) {
+    ARGUMENT_ERROR("image data is too short");
+  }
 
-    if (RSTRING_LEN(data) > ptr->data_size) {
-      exc = create_argument_error("image data is too large");
-      break;
-    }
-  } while (0);
+  if (RSTRING_LEN(data) > ptr->data_size) {
+    ARGUMENT_ERROR("image data is too large");
+  }
+
+  /*
+   * alloc memory
+   */
+  jpeg_mem_dest(&ptr->cinfo, &ptr->buf.mem, &ptr->buf.size); 
+  if (ptr->buf.mem == NULL) {
+    RUNTIME_ERROR("jpeg_mem_dest() failed");
+  }
+
+  /*
+   * prepare
+   */
+  SET_DATA(ptr, data);
 
   /*
    * do encode
    */
-  if (!RTEST(exc)) {
-    exc = do_encode(ptr, (uint8_t*)RSTRING_PTR(data));
-  }
+  ret = rb_protect(do_encode, (VALUE)ptr, &state);
 
   /*
-   * create return data
+   * post process
    */
-  if (!RTEST(exc)) {
-    ret = rb_str_buf_new(ptr->buf.size);
-    rb_str_set_len(ret, ptr->buf.size);
+  if (TEST_FLAG(ptr, F_START)) {
+    jpeg_finish_compress(&ptr->cinfo);
+    CLR_FLAG(ptr, F_START);
+  }
 
-    memcpy(RSTRING_PTR(ret), ptr->buf.mem, ptr->buf.size);
+  CLR_DATA(ptr);
 
+  if (ptr->buf.mem != NULL) {
     free(ptr->buf.mem);
 
     ptr->buf.mem  = NULL;
     ptr->buf.size = 0;
   }
 
-  /*
-   * post process
-   */
-  if (RTEST(exc)) rb_exc_raise(exc);
+  if (state != 0) rb_jump_tag(state);
 
   return ret;
 }
 
 static void
-rb_decoder_free(void* ptr)
+rb_decoder_free(void* _ptr)
 {
-  //jpeg_destroy_decompress(&(((jpeg_decode_t*)ptr)->cinfo));
+  jpeg_decode_t* ptr;
+
+  ptr = (jpeg_decode_t*)_ptr;
+
+  if (ptr->array != NULL) {
+    free(ptr->array);
+  }
+
+  if (TEST_FLAG(ptr, F_CREAT)) {
+    jpeg_destroy_decompress(&ptr->cinfo);
+  }
+
   free(ptr);
 }
 
@@ -1244,48 +1313,10 @@ rb_decoder_mark(void* _ptr)
   if (ptr->orientation.buf != Qnil) {
     rb_gc_mark(ptr->orientation.buf);
   }
-}
 
-static void
-decode_output_message(j_common_ptr cinfo)
-{
-  ext_error_t* err;
-
-  err = (ext_error_t*)cinfo->err;
-
-  (*err->jerr.format_message)(cinfo, err->msg);
-}
-
-static void
-decode_emit_message(j_common_ptr cinfo, int msg_level)
-{
-  ext_error_t* err;
-
-  if (msg_level < 0) {
-    err = (ext_error_t*)cinfo->err;
-    (*err->jerr.format_message)(cinfo, err->msg);
-    /*
-     * 以前はemit_messageが呼ばれるとエラー扱いしていたが、
-     * Logicoolの一部のモデルなどで問題が出るので無視する
-     * ようにした。
-     * また本来であれば、警告表示を行うべきでもあるが一部
-     * のモデルで大量にemitされる場合があるので表示しない
-     * ようにしている。
-     * 問題が発生した際は、最後のメッセージをオブジェクト
-     * のインスタンスとして持たすべき。
-     */
-    // longjmp(err->jmpbuf, 1);
+  if (ptr->data != Qnil) {
+    rb_gc_mark(ptr->data);
   }
-}
-
-static void
-decode_error_exit(j_common_ptr cinfo)
-{
-  ext_error_t* err;
-
-  err = (ext_error_t*)cinfo->err;
-  (*err->jerr.format_message)(cinfo, err->msg);
-  longjmp(err->jmpbuf, 1);
 }
 
 static VALUE
@@ -1296,59 +1327,40 @@ rb_decoder_alloc(VALUE self)
   ptr = ALLOC(jpeg_decode_t);
   memset(ptr, 0, sizeof(*ptr));
 
-  ptr->flags                    = DEFAULT_FLAGS;
-  ptr->format                   = FMT_RGB;
-
-  ptr->out_color_space          = JCS_RGB;
-
-  ptr->scale_num                = 1;
-  ptr->scale_denom              = 1;
-
-  ptr->out_color_components     = 3;
-  ptr->output_gamma             = 0.0;
-  ptr->buffered_image           = FALSE;
-  ptr->do_fancy_upsampling      = FALSE;
-  ptr->do_block_smoothing       = FALSE;
-  ptr->quantize_colors          = FALSE;
-  ptr->dither_mode              = JDITHER_NONE;
-  ptr->dct_method               = JDCT_FASTEST;
-  ptr->desired_number_of_colors = 0;
-  ptr->enable_1pass_quant       = FALSE;
-  ptr->enable_external_quant    = FALSE;
-  ptr->enable_2pass_quant       = FALSE;
-
-  ptr->orientation.value        = 0;
-  ptr->orientation.buf          = Qnil;
+  ptr->flags = DEFAULT_DECODE_FLAGS;
 
   return Data_Wrap_Struct(decoder_klass, rb_decoder_mark, rb_decoder_free, ptr);
 }
 
-static void
+static VALUE
 eval_decoder_pixel_format_opt(jpeg_decode_t* ptr, VALUE opt)
 {
+  VALUE ret;
   int format;
   int color_space;
   int components;
 
-  if (opt != Qundef) {
+  ret = Qnil;
+
+  switch (TYPE(opt)) {
+  case T_UNDEF:
+    format      = FMT_RGB;
+    color_space = JCS_RGB;
+    components  = 3;
+    break;
+
+  case T_STRING:
+  case T_SYMBOL:
     if(EQ_STR(opt, "RGB") || EQ_STR(opt, "RGB24")) {
       format      = FMT_RGB;
       color_space = JCS_RGB;
       components  = 3;
 
     } else if (EQ_STR(opt, "YUV422") || EQ_STR(opt, "YUYV")) {
-      format      = FMT_YUV422;
-      color_space = JCS_YCbCr;
-      components  = 3;
-
-      NOT_IMPLEMENTED_ERROR( "not implemented colorspace");
+      ret = create_not_implement_error( "not implemented colorspace");
 
     } else if (EQ_STR(opt, "RGB565")) {
-      format      = FMT_RGB565;
-      color_space = JCS_RGB;
-      components  = 3;
-
-      NOT_IMPLEMENTED_ERROR( "not implemented colorspace");
+      ret = create_not_implement_error( "not implemented colorspace");
 
     } else if (EQ_STR(opt, "GRAYSCALE")) {
       format      = FMT_GRAYSCALE;
@@ -1381,277 +1393,479 @@ eval_decoder_pixel_format_opt(jpeg_decode_t* ptr, VALUE opt)
       components  = 4;
 
     } else {
-      ARGUMENT_ERROR("Unsupportd :pixel_format option value.");
+      ret = create_argument_error("unsupportd :pixel_format option value");
     }
+    break;
 
-    ptr->format                = format;
-    ptr->out_color_space       = color_space;
-    ptr->out_color_components  = components;
+  default:
+    ret = create_type_error("unsupportd :pixel_format option type");
+    break;
   }
+
+  if (!RTEST(ret)) {
+    ptr->format               = format;
+    ptr->out_color_space      = color_space;
+    ptr->out_color_components = components;
+  }
+
+  return ret;
 }
 
-static void
+static VALUE
 eval_decoder_output_gamma_opt(jpeg_decode_t* ptr, VALUE opt)
 {
+  VALUE ret;
+  double gamma;
+
+  ret = Qnil;
+
   switch (TYPE(opt)) {
   case T_UNDEF:
-    // Nothing
+    gamma = 0.0;
     break;
 
   case T_FIXNUM:
   case T_FLOAT:
-    ptr->output_gamma = NUM2DBL(opt);
+    if (isnan(NUM2DBL(opt)) || isinf(NUM2DBL(opt))) {
+      ret = create_argument_error("unsupported :output_gamma value");
+    } else {
+      gamma = NUM2DBL(opt);
+    }
     break;
 
   default:
-    TYPE_ERROR("Unsupportd :output_gamma option value.");
+    ret = create_type_error("unsupported :output_gamma type");
     break;
   }
+
+  if (!RTEST(ret)) ptr->output_gamma = gamma;
+
+  return ret;
 }
 
-static void
+static VALUE
 eval_decoder_do_fancy_upsampling_opt(jpeg_decode_t* ptr, VALUE opt)
 {
-  if (opt != Qundef) {
-    ptr->do_fancy_upsampling = (RTEST(opt))? TRUE: FALSE;
+  if (opt != Qundef && RTEST(opt)) {
+    ptr->do_fancy_upsampling = TRUE;
+  } else {
+    ptr->do_fancy_upsampling = FALSE;
   }
+
+  return Qnil;
 }
 
-static void
+static VALUE
 eval_decoder_do_smoothing_opt(jpeg_decode_t* ptr, VALUE opt)
 {
-  if (opt != Qundef) {
-    ptr->do_block_smoothing = (RTEST(opt))? TRUE: FALSE;
+  if (opt != Qundef && RTEST(opt)) {
+    ptr->do_block_smoothing = TRUE;
+  } else {
+    ptr->do_block_smoothing = FALSE;
   }
+
+  return Qnil;
 }
 
-static void
+static VALUE
 eval_decoder_dither_opt( jpeg_decode_t* ptr, VALUE opt)
 {
-  VALUE dmode;
-  VALUE pass2;
-  VALUE n_col;
+  VALUE ret;
+  VALUE tmp;
+  int mode;
+  int quant;
+  int pass2;
+  int ncol;
 
-  if (opt != Qundef) {
-    if (TYPE(opt) != T_ARRAY) {
-      TYPE_ERROR("Unsupportd :dither option value.");
-    }
+  ret = Qnil;
 
+  switch (TYPE(opt)) {
+  case T_UNDEF:
+    mode  = JDITHER_NONE;
+    quant = FALSE;
+    ncol  = 0;
+    pass2 = FALSE;
+    break;
+
+  case T_ARRAY:
     if (RARRAY_LEN(opt) != 3) {
-      ARGUMENT_ERROR(":dither is illeagal length (shall be 3 entries).");
-    }
+      ret = create_argument_error(":dither invalid size");
 
-    dmode = RARRAY_AREF(opt, 0);
-    pass2 = RARRAY_AREF(opt, 1);
-    n_col = RARRAY_AREF(opt, 2);
-    
-    if (EQ_STR(dmode, "NONE")) {
-      ptr->dither_mode     = JDITHER_NONE;
-      ptr->quantize_colors = FALSE;
+    } else do {
+      /*
+       * dither mode
+       */
+      tmp = rb_ary_entry(opt, 0);
+      if (TYPE(tmp) != T_STRING && TYPE(tmp) != T_SYMBOL) {
+        ret = create_type_error("unsupported dither mode type");
+        break;
 
-    } else if(EQ_STR(dmode, "ORDERED")) {
-      ptr->dither_mode     = JDITHER_ORDERED;
-      ptr->quantize_colors = TRUE;
+      } else if (EQ_STR(tmp, "NONE")) {
+        mode  = JDITHER_NONE;
+        quant = FALSE;
 
-    } else if(EQ_STR(dmode, "FS")) {
-      ptr->dither_mode     = JDITHER_FS;
-      ptr->quantize_colors = TRUE;
+      } else if(EQ_STR(tmp, "ORDERED")) {
+        mode  = JDITHER_ORDERED;
+        quant = TRUE;
 
-    } else {
-      ARGUMENT_ERROR("dither mode is illeagal value.");
-    }
+      } else if(EQ_STR(tmp, "FS")) {
+        mode  = JDITHER_FS;
+        quant = TRUE;
 
-    ptr->two_pass_quantize = (RTEST(pass2))? TRUE: FALSE;
+      } else {
+        ret = create_argument_error("dither mode is illeagal value.");
+        break;
+      }
 
-    if (TYPE(n_col) == T_FIXNUM) {
-      ptr->desired_number_of_colors = FIX2INT(n_col);
+      /*
+       * 2 pass flag
+       */
+      pass2 = (RTEST(rb_ary_entry(opt, 1)))? TRUE: FALSE;
 
-      if (ptr->desired_number_of_colors < 8 ||
-          ptr->desired_number_of_colors > 256) {
-        RANGE_ERROR("number of dithered colors shall be from 8 to 256.");
-      } 
+      /*
+       * number of color
+       */
+      tmp = rb_ary_entry(opt, 2);
+      if (TYPE(tmp) != T_FIXNUM) {
+        ret = create_type_error("unsupported number of colors type");
+        break;
 
-    } else {
-      TYPE_ERROR("number of dithered colors is illeagal value.");
-    }
+      } else if (FIX2LONG(tmp) < 8) {
+        ret = create_range_error("number of colors less than 0");
+        break;
 
-    SET_FLAG(ptr, F_DITHER);
+      } else if (FIX2LONG(tmp) > 256) {
+        ret = create_range_error("number of colors greater than 256");
+        break;
+
+      } else {
+        ncol = FIX2INT(tmp); 
+      }
+    } while (0);
+    break;
+
+  default:
+    ret = create_type_error("unsupported :dither type");
+    break;
   }
+
+  if (!RTEST(ret)) {
+    ptr->dither_mode              = mode;
+    ptr->quantize_colors          = quant;
+    ptr->two_pass_quantize        = pass2;
+    ptr->desired_number_of_colors = ncol;
+
+    if (mode != JDITHER_NONE) SET_FLAG(ptr, F_DITHER);
+  }
+
+  return ret;
 }
 
 #if 0
 static void
 eval_decoder_use_1pass_quantizer_opt(jpeg_decode_t* ptr, VALUE opt)
 {
-  if (opt != Qundef) {
-    if (RTEST(opt)) {
-      ptr->enable_1pass_quant = TRUE;
-      ptr->buffered_image     = TRUE;
-    } else {
-      ptr->enable_1pass_quant = FALSE;
-    }
+  if (opt != Qundef && RTEST(opt)) {
+    ptr->enable_1pass_quant = TRUE;
+  } else {
+    ptr->enable_1pass_quant = FALSE;
   }
+
+  return Qnil;
 }
 
-static void
+static VALUE
 eval_decoder_use_external_colormap_opt(jpeg_decode_t* ptr, VALUE opt)
 {
-  if (opt != Qundef) {
-    if (RTEST(opt)) {
+  if (opt != Qundef && RTEST(opt)) {
       ptr->enable_external_quant = TRUE;
-      ptr->buffered_image        = TRUE;
     } else {
       ptr->enable_external_quant = FALSE;
     }
   }
+
+  return Qnil;
 }
 
-static void
+static VALUE
 eval_decoder_use_2pass_quantizer_opt(jpeg_decode_t* ptr, VALUE opt)
 {
-  if (opt != Qundef) {
-    if (RTEST(opt)) {
+  if (opt != Qundef && RTEST(opt)) {
       ptr->enable_2pass_quant = TRUE;
-      ptr->buffered_image     = TRUE;
     } else {
       ptr->enable_2pass_quant = FALSE;
     }
   }
+
+  return Qnil;
 }
 #endif
 
-static void
+static VALUE
 eval_decoder_without_meta_opt(jpeg_decode_t* ptr, VALUE opt)
 {
-  if (opt != Qundef) {
-    if (RTEST(opt)) {
-      CLR_FLAG(ptr, F_NEED_META);
-    } else {
-      SET_FLAG(ptr, F_NEED_META);
-    }
+  if (opt != Qundef && RTEST(opt)) {
+    CLR_FLAG(ptr, F_NEED_META);
+  } else {
+    SET_FLAG(ptr, F_NEED_META);
   }
+
+  return Qnil;
 }
 
-static void
+static VALUE
 eval_decoder_expand_colormap_opt(jpeg_decode_t* ptr, VALUE opt)
 {
-  if (opt != Qundef) {
-    if (RTEST(opt)) {
-      SET_FLAG(ptr, F_EXPAND_COLORMAP);
-    } else {
-      CLR_FLAG(ptr, F_EXPAND_COLORMAP);
-    }
+  if (opt != Qundef && RTEST(opt)) {
+    SET_FLAG(ptr, F_EXPAND_COLORMAP);
+  } else {
+    CLR_FLAG(ptr, F_EXPAND_COLORMAP);
   }
+
+  return Qnil;
 }
 
-static void
+
+static VALUE
 eval_decoder_scale_opt(jpeg_decode_t* ptr, VALUE opt)
 {
+  VALUE ret;
+  int scale_num;
+  int scale_denom;
+
+  ret = Qnil;
+
   switch (TYPE(opt)) {
   case T_UNDEF:
-    // Nothing
+    scale_num   = 1;
+    scale_denom = 1;
+    break;
+
+  case T_FIXNUM:
+    if (FIX2LONG(opt) <= 0) {
+      ret = create_range_error(":scale less equal 0");
+
+    } else {
+      scale_num   = FIX2INT(opt) * 1000;
+      scale_denom = 1000;
+    }
     break;
 
   case T_FLOAT:
-    ptr->scale_num   = (int)(NUM2DBL(opt) * 1000.0);
-    ptr->scale_denom = 1000;
+    if (isnan(NUM2DBL(opt)) || isinf(NUM2DBL(opt))) {
+      ret = create_argument_error("unsupportd :quality option value");
+      
+    } else if (NUM2DBL(opt) <= 0.0) {
+      ret = create_range_error(":scale less equal 0");
+
+    } else {
+      scale_num   = (int)(NUM2DBL(opt) * 1000.0);
+      scale_denom = 1000;
+    }
     break;
 
   case T_RATIONAL:
-    ptr->scale_num   = FIX2INT(rb_rational_num(opt));
-    ptr->scale_denom = FIX2INT(rb_rational_den(opt));
-    break;
-
-  case T_ARRAY:
-    if (RARRAY_LEN(opt) != 2) {
-      ARGUMENT_ERROR("invalid length");
-    }
-    ptr->scale_num   = FIX2INT(RARRAY_AREF(opt, 0));
-    ptr->scale_denom = FIX2INT(RARRAY_AREF(opt, 1));
+    scale_num   = (int)FIX2LONG(rb_rational_num(opt));
+    scale_denom = (int)FIX2LONG(rb_rational_den(opt));
     break;
 
   default:
-    TYPE_ERROR("Unsupportd :exapnd_colormap option value.");
+    ret = create_type_error("unsupportd :scale option type");
     break;
   }
+
+  if (!RTEST(ret)) {
+    ptr->scale_num   = scale_num;
+    ptr->scale_denom = scale_denom;
+  }
+
+  return ret;
 }
 
-static void
+static VALUE
 eval_decoder_dct_method_opt(jpeg_decode_t* ptr, VALUE opt)
 {
-  if (opt != Qundef) {
-    if (EQ_STR(opt, "ISLOW")) {
-      ptr->dct_method = JDCT_ISLOW;
+  VALUE ret;
+  int dct_method;
+
+  ret = Qnil;
+
+  switch (TYPE(opt)) {
+  case T_UNDEF:
+    dct_method = JDCT_FASTEST;
+    break;
+
+  case T_STRING:
+  case T_SYMBOL:
+    if (EQ_STR(opt, "FASTEST")) {
+      dct_method = JDCT_FASTEST;
+
+    } else if (EQ_STR(opt, "ISLOW")) {
+      dct_method = JDCT_ISLOW;
 
     } else if (EQ_STR(opt, "IFAST")) {
-      ptr->dct_method = JDCT_IFAST;
+      dct_method = JDCT_IFAST;
 
     } else if (EQ_STR(opt, "FLOAT")) {
-      ptr->dct_method = JDCT_FLOAT;
-
-    } else if (EQ_STR(opt, "FASTEST")) {
-      ptr->dct_method = JDCT_FASTEST;
+      dct_method = JDCT_FLOAT;
 
     } else {
-      ARGUMENT_ERROR("Unsupportd :dct_method option value.");
+      ret = create_argument_error("unsupportd :dct_method option value");
     }
+    break;
+
+  default:
+    ret = create_type_error("unsupportd :dct_method option type");
+    break;
   }
+
+  if (!RTEST(ret)) ptr->dct_method = dct_method;
+
+  return ret;
 }
 
-static void
+static VALUE
 eval_decoder_with_exif_tags_opt(jpeg_decode_t* ptr, VALUE opt)
 {
-  if (opt != Qundef) {
-    if (RTEST(opt)) {
-      SET_FLAG(ptr, F_PARSE_EXIF);
-    } else {
-      CLR_FLAG(ptr, F_PARSE_EXIF);
-    }
+  if (opt != Qundef && RTEST(opt)) {
+    SET_FLAG(ptr, F_PARSE_EXIF);
+  } else {
+    CLR_FLAG(ptr, F_PARSE_EXIF);
   }
+
+  return Qnil;
 }
 
-static void
+static VALUE
 eval_decoder_orientation_opt(jpeg_decode_t* ptr, VALUE opt)
 {
-  if (opt != Qundef) {
-    if (RTEST(opt)) {
-      SET_FLAG(ptr, F_APPLY_ORIENTATION);
-    } else {
-      CLR_FLAG(ptr, F_APPLY_ORIENTATION);
-    }
+  if (opt != Qundef && RTEST(opt)) {
+    SET_FLAG(ptr, F_APPLY_ORIENTATION);
+  } else {
+    CLR_FLAG(ptr, F_APPLY_ORIENTATION);
   }
+
+  return Qnil;
 }
 
-static void
+static VALUE
 set_decoder_context( jpeg_decode_t* ptr, VALUE opt)
 {
+  VALUE ret;
   VALUE opts[N(decoder_opts_ids)];
+  JSAMPARRAY ary;
+
+  /*
+   * initialize
+   */
+  ret = Qnil;
+  ary = NULL;
 
   /*
    * parse options
    */
-  rb_get_kwargs(opt, decoder_opts_ids, 0, N(decoder_opts_ids), opts);
+  do {
+    rb_get_kwargs(opt, decoder_opts_ids, 0, N(decoder_opts_ids), opts);
+
+    /*
+     * set context
+     */
+    ret = eval_decoder_pixel_format_opt(ptr, opts[0]);
+    if (RTEST(ret)) break;
+
+    ret = eval_decoder_output_gamma_opt(ptr, opts[1]);
+    if (RTEST(ret)) break;
+
+    ret = eval_decoder_do_fancy_upsampling_opt(ptr, opts[2]);
+    if (RTEST(ret)) break;
+
+    ret = eval_decoder_do_smoothing_opt(ptr, opts[3]);
+    if (RTEST(ret)) break;
+
+    ret = eval_decoder_dither_opt(ptr, opts[4]);
+    if (RTEST(ret)) break;
+
+#if 0
+    ret = eval_decoder_use_1pass_quantizer_opt(ptr, opts[5]);
+    if (RTEST(ret)) break;
+
+    ret = eval_decoder_use_external_colormap_opt(ptr, opts[6]);
+    if (RTEST(ret)) break;
+
+    ret = eval_decoder_use_2pass_quantizer_opt(ptr, opts[7]);
+    if (RTEST(ret)) break;
+#endif
+
+    ret = eval_decoder_without_meta_opt(ptr, opts[5]);
+    if (RTEST(ret)) break;
+
+    ret = eval_decoder_expand_colormap_opt(ptr, opts[6]);
+    if (RTEST(ret)) break;
+
+    ret = eval_decoder_scale_opt(ptr, opts[7]);
+    if (RTEST(ret)) break;
+
+    ret = eval_decoder_dct_method_opt(ptr, opts[8]);
+    if (RTEST(ret)) break;
+
+    ret = eval_decoder_with_exif_tags_opt(ptr, opts[9]);
+    if (RTEST(ret)) break;
+
+    ret = eval_decoder_orientation_opt(ptr, opts[10]);
+    if (RTEST(ret)) break;
+  } while (0);
 
   /*
-   * set context
+   * alloc memory
    */
-  eval_decoder_pixel_format_opt(ptr, opts[0]);
-  eval_decoder_output_gamma_opt(ptr, opts[1]);
-  eval_decoder_do_fancy_upsampling_opt(ptr, opts[2]);
-  eval_decoder_do_smoothing_opt(ptr, opts[3]);
-  eval_decoder_dither_opt(ptr, opts[4]);
+  if (!RTEST(ret)) {
+    ary = ALLOC_ARRAY();
+    if (ary == NULL) ret = create_memory_error();
+  }
+
+  /*
+   * set the rest context parameter
+   */
+  if (!RTEST(ret)) {
+    ptr->err_mgr.jerr.output_message = output_message;
+    ptr->err_mgr.jerr.emit_message   = emit_message;
+    ptr->err_mgr.jerr.error_exit     = error_exit;
+
+    // 現時点でオプションでの対応をおこなっていないので
+    // ここで値を設定
+    ptr->enable_1pass_quant    = FALSE;
+    ptr->enable_external_quant = FALSE;
+    ptr->enable_2pass_quant    = FALSE;
+    ptr->buffered_image        = FALSE;
+
 #if 0
-  eval_decoder_use_1pass_quantizer_opt(ptr, opts[5]);
-  eval_decoder_use_external_colormap_opt(ptr, opts[6]);
-  eval_decoder_use_2pass_quantizer_opt(ptr, opts[7]);
+    if (ptr->enable_1pass_quant == TRUE ||
+        ptr->enable_external_quant == TRUE ||
+        ptr->enable_2pass_quant == TRUE) {
+      ptr->buffered_image = TRUE;
+
+    } else {
+      ptr->buffered_image = FALSE;
+    }
 #endif
-  eval_decoder_without_meta_opt(ptr, opts[5]);
-  eval_decoder_expand_colormap_opt(ptr, opts[6]);
-  eval_decoder_scale_opt(ptr, opts[7]);
-  eval_decoder_dct_method_opt(ptr, opts[8]);
-  eval_decoder_with_exif_tags_opt(ptr, opts[9]);
-  eval_decoder_with_exif_tags_opt(ptr, opts[10]);
-  eval_decoder_orientation_opt(ptr, opts[11]);
+
+    ptr->array             = ary;
+    ptr->data              = Qnil;
+    ptr->orientation.value = 0;
+    ptr->orientation.buf   = Qnil;
+  }
+
+  /*
+   * setup libjpeg
+   */
+  if (!RTEST(ret)) {
+    jpeg_create_decompress(&ptr->cinfo);
+    SET_FLAG(ptr, F_CREAT);
+
+    ptr->cinfo.err = jpeg_std_error(&ptr->err_mgr.jerr);
+  }
+
+  return ret;
 }
 
 /**
@@ -1706,6 +1920,7 @@ static VALUE
 rb_decoder_initialize( int argc, VALUE *argv, VALUE self)
 {
   jpeg_decode_t* ptr;
+  VALUE exc;
   VALUE opt;
 
   /*
@@ -1716,14 +1931,17 @@ rb_decoder_initialize( int argc, VALUE *argv, VALUE self)
   /*
    * parse arguments
    */
-  rb_scan_args( argc, argv, "01", &opt);
-
-  if (opt != Qnil) Check_Type(opt, T_HASH);
+  rb_scan_args( argc, argv, "0:", &opt);
 
   /*
    * set context
    */ 
-  set_decoder_context(ptr, opt);
+  exc = set_decoder_context(ptr, opt);
+
+  /*
+   * post process
+   */
+  if (RTEST(exc)) rb_exc_raise(exc);
 
   return Qtrue;
 }
@@ -1732,6 +1950,7 @@ static VALUE
 rb_decoder_set(VALUE self, VALUE opt)
 {
   jpeg_decode_t* ptr;
+  VALUE exc;
 
   /*
    * initialize
@@ -1746,7 +1965,12 @@ rb_decoder_set(VALUE self, VALUE opt)
   /*
    * set context
    */ 
-  set_decoder_context(ptr, opt);
+  exc = set_decoder_context(ptr, opt);
+
+  /*
+   * post process
+   */
+  if (RTEST(exc)) rb_exc_raise(exc);
 
   return Qtrue;
 }
@@ -2618,32 +2842,38 @@ create_meta(jpeg_decode_t* ptr)
 }
 
 static VALUE
-do_read_header(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
+do_read_header(VALUE _ptr)
 {
   VALUE ret;
+  jpeg_decode_t* ptr;
+  uint8_t* data;
+  size_t size;
 
-  switch (ptr->format) {
-  case FMT_YUV422:
-  case FMT_RGB565:
-    NOT_IMPLEMENTED_ERROR( "not implemented colorspace");
-    break;
-  }
+  /*
+   * initialize
+   */
+  ret  = Qnil;
+  ptr  = (jpeg_decode_t*)_ptr;
+  data = (uint8_t*)RSTRING_PTR(ptr->data);
+  size = RSTRING_LEN(ptr->data);
 
-  jpeg_create_decompress(&ptr->cinfo);
-
-  ptr->cinfo.err                   = jpeg_std_error(&ptr->err_mgr.jerr);
-  ptr->err_mgr.jerr.output_message = decode_output_message;
-  ptr->err_mgr.jerr.emit_message   = decode_emit_message;
-  ptr->err_mgr.jerr.error_exit     = decode_error_exit;
-
-  ptr->cinfo.raw_data_out          = FALSE;
-  ptr->cinfo.dct_method            = JDCT_FLOAT;
+  /*
+   * process body
+   */
+  ptr->cinfo.raw_data_out = FALSE;
+  ptr->cinfo.dct_method   = JDCT_FLOAT;
 
   if (setjmp(ptr->err_mgr.jmpbuf)) {
-    jpeg_destroy_decompress(&ptr->cinfo);
+    /*
+     * when error occurred
+     */
     rb_raise(decerr_klass, "%s", ptr->err_mgr.msg);
+
   } else {
-    jpeg_mem_src(&ptr->cinfo, jpg, jpg_sz);
+    /*
+     * normal path
+     */
+    jpeg_mem_src(&ptr->cinfo, data, size);
 
     if (TEST_FLAG(ptr, F_PARSE_EXIF | F_APPLY_ORIENTATION)) {
       jpeg_save_markers(&ptr->cinfo, JPEG_APP1, 0xFFFF);
@@ -2657,8 +2887,6 @@ do_read_header(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
     }
 
     ret = create_meta(ptr);
-
-    jpeg_destroy_decompress(&ptr->cinfo);
   }
 
   return ret;
@@ -2678,10 +2906,14 @@ rb_decoder_read_header(VALUE self, VALUE data)
 {
   VALUE ret;
   jpeg_decode_t* ptr;
+  int state;
 
   /*
    * initialize
    */
+  ret   = Qnil;
+  state = 0;
+
   Data_Get_Struct(self, jpeg_decode_t, ptr);
 
   /*
@@ -2690,9 +2922,21 @@ rb_decoder_read_header(VALUE self, VALUE data)
   Check_Type(data, T_STRING);
 
   /*
+   * prepare
+   */
+  SET_DATA(ptr, data);
+
+  /*
    * do encode
    */
-  ret = do_read_header(ptr, (uint8_t*)RSTRING_PTR(data), RSTRING_LEN(data));
+  ret = rb_protect(do_read_header, (VALUE)ptr, &state);
+
+  /*
+   * post process
+   */
+  CLR_DATA(ptr);
+
+  if (state != 0) rb_jump_tag(state);
 
   return ret;
 }
@@ -3184,9 +3428,14 @@ apply_orientation(jpeg_decode_t* ptr, VALUE img)
 }
 
 static VALUE
-do_decode(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
+do_decode(VALUE _ptr)
 {
   VALUE ret;
+
+  jpeg_decode_t* ptr;
+  uint8_t* data;
+  size_t size;
+
   struct jpeg_decompress_struct* cinfo;
   JSAMPARRAY array;
 
@@ -3196,102 +3445,87 @@ do_decode(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
   int i;
   int j;
 
-  ret   = Qundef; // warning対策
+  /*
+   * initialize
+   */
+  ret   = Qnil; // warning対策
+  ptr   = (jpeg_decode_t*)_ptr;
+  data  = (uint8_t*)RSTRING_PTR(ptr->data);
+  size  = RSTRING_LEN(ptr->data);
   cinfo = &ptr->cinfo;
-  array = ALLOC_ARRAY();
-                  
-  switch (ptr->format) {
-  case FMT_YUV422:
-  case FMT_RGB565:
-    NOT_IMPLEMENTED_ERROR( "not implemented colorspace");
-    break;
+  array = ptr->array;
 
-  case FMT_GRAYSCALE:
-  case FMT_YUV:
-  case FMT_RGB:
-  case FMT_BGR:
-  case FMT_YVU:
-  case FMT_RGB32:
-  case FMT_BGR32:
-    jpeg_create_decompress(cinfo);
+  /*
+   * do decode
+   */
+  if (setjmp(ptr->err_mgr.jmpbuf)) {
+    /*
+     * when error occurred
+     */
+    rb_raise(decerr_klass, "%s", ptr->err_mgr.msg);
 
-    cinfo->err                       = jpeg_std_error(&ptr->err_mgr.jerr);
-    ptr->err_mgr.jerr.output_message = decode_output_message;
-    ptr->err_mgr.jerr.emit_message   = decode_emit_message;
-    ptr->err_mgr.jerr.error_exit     = decode_error_exit;
+  } else {
+    /*
+     * normal path
+     */
+    jpeg_mem_src(cinfo, data, size);
 
-    if (setjmp(ptr->err_mgr.jmpbuf)) {
-      jpeg_abort_decompress(cinfo);
-      jpeg_destroy_decompress(&ptr->cinfo);
-
-      free(array);
-      rb_raise(decerr_klass, "%s", ptr->err_mgr.msg);
-
-    } else {
-      jpeg_mem_src(cinfo, jpg, jpg_sz);
-
-      if (TEST_FLAG(ptr, F_PARSE_EXIF | F_APPLY_ORIENTATION)) {
-        jpeg_save_markers(&ptr->cinfo, JPEG_APP1, 0xFFFF);
-      }
-
-      jpeg_read_header(cinfo, TRUE);
-
-      cinfo->raw_data_out              = FALSE;
-      cinfo->dct_method                = ptr->dct_method;
-
-      cinfo->out_color_space           = ptr->out_color_space;
-      cinfo->out_color_components      = ptr->out_color_components;
-      cinfo->scale_num                 = ptr->scale_num;
-      cinfo->scale_denom               = ptr->scale_denom;
-      cinfo->output_gamma              = ptr->output_gamma;
-      cinfo->do_fancy_upsampling       = ptr->do_fancy_upsampling;
-      cinfo->do_block_smoothing        = ptr->do_block_smoothing;
-      cinfo->quantize_colors           = ptr->quantize_colors;
-      cinfo->dither_mode               = ptr->dither_mode;
-      cinfo->two_pass_quantize         = ptr->two_pass_quantize;
-      cinfo->desired_number_of_colors  = ptr->desired_number_of_colors;
-      cinfo->enable_1pass_quant        = ptr->enable_1pass_quant;
-      cinfo->enable_external_quant     = ptr->enable_external_quant;
-      cinfo->enable_2pass_quant        = ptr->enable_2pass_quant;
-
-      jpeg_calc_output_dimensions(cinfo);
-      jpeg_start_decompress(cinfo);
-
-      stride = cinfo->output_components * cinfo->output_width;
-      raw_sz = stride * cinfo->output_height;
-      ret    = rb_str_buf_new(raw_sz);
-      raw    = (uint8_t*)RSTRING_PTR(ret);
-
-      while (cinfo->output_scanline < cinfo->output_height) {
-        for (i = 0, j = cinfo->output_scanline; i < UNIT_LINES; i++, j++) {
-          array[i] = raw + (j * stride);
-        }
-
-        jpeg_read_scanlines(cinfo, array, UNIT_LINES);
-      }
-
-      if (TEST_FLAG(ptr, F_EXPAND_COLORMAP) && IS_COLORMAPPED(cinfo)) {
-        ret = expand_colormap(cinfo, raw);
-      } else {
-        rb_str_set_len(ret, raw_sz);
-      }
-
-      if (ptr->format == FMT_YVU) swap_cbcr(raw, raw_sz);
-
-      if (TEST_FLAG(ptr, F_APPLY_ORIENTATION)) {
-        pick_exif_orientation(ptr);
-        ret = apply_orientation(ptr, ret);
-      }
-
-      if (TEST_FLAG(ptr, F_NEED_META)) add_meta(ret, ptr);
-
-      jpeg_finish_decompress(cinfo);
-      jpeg_destroy_decompress(&ptr->cinfo);
+    if (TEST_FLAG(ptr, F_PARSE_EXIF | F_APPLY_ORIENTATION)) {
+      jpeg_save_markers(&ptr->cinfo, JPEG_APP1, 0xFFFF);
     }
-    break;
-  }
 
-  free(array);
+    jpeg_read_header(cinfo, TRUE);
+    jpeg_calc_output_dimensions(cinfo);
+
+    cinfo->raw_data_out             = FALSE;
+    cinfo->dct_method               = ptr->dct_method;
+           
+    cinfo->out_color_space          = ptr->out_color_space;
+    cinfo->out_color_components     = ptr->out_color_components;
+    cinfo->scale_num                = ptr->scale_num;
+    cinfo->scale_denom              = ptr->scale_denom;
+    cinfo->output_gamma             = ptr->output_gamma;
+    cinfo->do_fancy_upsampling      = ptr->do_fancy_upsampling;
+    cinfo->do_block_smoothing       = ptr->do_block_smoothing;
+    cinfo->quantize_colors          = ptr->quantize_colors;
+    cinfo->dither_mode              = ptr->dither_mode;
+    cinfo->two_pass_quantize        = ptr->two_pass_quantize;
+    cinfo->desired_number_of_colors = ptr->desired_number_of_colors;
+    cinfo->enable_1pass_quant       = ptr->enable_1pass_quant;
+    cinfo->enable_external_quant    = ptr->enable_external_quant;
+    cinfo->enable_2pass_quant       = ptr->enable_2pass_quant;
+
+    jpeg_start_decompress(cinfo);
+    SET_FLAG(ptr, F_START);
+
+    stride = cinfo->output_components * cinfo->output_width;
+    raw_sz = stride * cinfo->output_height;
+    ret    = rb_str_buf_new(raw_sz);
+    raw    = (uint8_t*)RSTRING_PTR(ret);
+
+    while (cinfo->output_scanline < cinfo->output_height) {
+      for (i = 0, j = cinfo->output_scanline; i < UNIT_LINES; i++, j++) {
+        array[i] = raw + (j * stride);
+      }
+
+      jpeg_read_scanlines(cinfo, array, UNIT_LINES);
+    }
+
+    if (TEST_FLAG(ptr, F_EXPAND_COLORMAP) && IS_COLORMAPPED(cinfo)) {
+      ret = expand_colormap(cinfo, raw);
+    } else {
+      rb_str_set_len(ret, raw_sz);
+    }
+
+    if (ptr->format == FMT_YVU) swap_cbcr(raw, raw_sz);
+
+    if (TEST_FLAG(ptr, F_APPLY_ORIENTATION)) {
+      pick_exif_orientation(ptr);
+      ret = apply_orientation(ptr, ret);
+    }
+
+    if (TEST_FLAG(ptr, F_NEED_META)) add_meta(ret, ptr);
+  }
 
   return ret;
 }
@@ -3308,25 +3542,51 @@ do_decode(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
 static VALUE
 rb_decoder_decode(VALUE self, VALUE data)
 {
-    VALUE ret;
-    jpeg_decode_t* ptr;
+  VALUE ret;
+  jpeg_decode_t* ptr;
+  int state;
 
-    /*
-     * initialize
-     */
-    Data_Get_Struct(self, jpeg_decode_t, ptr);
+  /*
+   * initialize
+   */
+  ret   = Qnil;
+  state = 0;
 
-    /*
-     * argument check
-     */
-    Check_Type(data, T_STRING);
+  Data_Get_Struct(self, jpeg_decode_t, ptr);
 
-    /*
-     * do encode
-     */
-    ret = do_decode(ptr, (uint8_t*)RSTRING_PTR(data), RSTRING_LEN(data));
+  /*
+   * argument check
+   */
+  Check_Type(data, T_STRING);
 
-    return ret;
+  /*
+   * prepare
+   */
+  SET_DATA(ptr, data);
+
+  /*
+   * do decode
+   */
+  ret = rb_protect(do_decode, (VALUE)ptr, &state);
+
+  /*
+   * post process
+   */
+  if (TEST_FLAG(ptr, F_START)) {
+    if (state == 0) {
+      jpeg_finish_decompress(&ptr->cinfo);
+    } else {
+      jpeg_abort_decompress(&ptr->cinfo);
+    }
+
+    CLR_FLAG(ptr, F_START);
+  }
+
+  CLR_DATA(ptr);
+
+  if (state != 0) rb_jump_tag(state);
+
+  return ret;
 }
 
 static VALUE
@@ -3336,28 +3596,19 @@ rb_test_image(VALUE self, VALUE data)
   struct jpeg_decompress_struct cinfo;
   ext_error_t err_mgr;
 
-  jpeg_create_decompress(&cinfo);
-
-  cinfo.err                   = jpeg_std_error(&err_mgr.jerr);
-
-  err_mgr.jerr.output_message = decode_output_message;
-  err_mgr.jerr.emit_message   = decode_emit_message;
-  err_mgr.jerr.error_exit     = decode_error_exit;
-
-  cinfo.raw_data_out          = FALSE;
-  cinfo.dct_method            = JDCT_FLOAT;
+  cinfo.raw_data_out = FALSE;
+  cinfo.dct_method   = JDCT_FLOAT;
 
   if (setjmp(err_mgr.jmpbuf)) {
-    ret = Qtrue;
-  } else {
     ret = Qfalse;
 
+  } else {
     jpeg_mem_src(&cinfo, (uint8_t*)RSTRING_PTR(data), RSTRING_LEN(data));
     jpeg_read_header(&cinfo, TRUE);
     jpeg_calc_output_dimensions(&cinfo);
-  }
 
-  jpeg_destroy_decompress(&cinfo);
+    ret = Qtrue;
+  }
 
   return ret;
 }
