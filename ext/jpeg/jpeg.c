@@ -30,6 +30,7 @@
 #define F_PARSE_EXIF               0x00000004
 #define F_APPLY_ORIENTATION        0x00000008
 #define F_DITHER                   0x00000010
+#define F_CREATE                   0x00010000
 
 #define SET_FLAG(ptr, msk)         ((ptr)->flags |= (msk))
 #define CLR_FLAG(ptr, msk)         ((ptr)->flags &= ~(msk))
@@ -257,14 +258,16 @@ static const char* encoder_opts_keys[] = {
   "quality",                  // {integer}
   "scale",                    // {rational} or {float}
   "dct_method",               // {str}
-  "orientation"               // {integer}
+  "orientation",              // {integer}
   "stride"                    // {integer}
 };
 
 static ID encoder_opts_ids[N(encoder_opts_keys)];
 
 typedef struct {
+  int flags;
   int format;
+
   int width;
   int stride;
   int height;
@@ -392,17 +395,27 @@ encode_output_message(j_common_ptr cinfo)
 static void
 encode_error_exit(j_common_ptr cinfo)
 {
+  jpeg_encode_t* ptr;
   char msg[JMSG_LENGTH_MAX];
 
   (*cinfo->err->format_message)(cinfo, msg);
 
-  jpeg_destroy_compress((j_compress_ptr)cinfo);
+  ptr = (jpeg_encode_t*)cinfo->client_data;
+
+  jpeg_destroy_compress(&ptr->cinfo);
+  CLR_FLAG(ptr, F_CREATE);
+
   rb_raise(encerr_klass, "%s", msg);
 }
 
+static void
+rb_encoder_mark(void* _ptr)
+{
+  /* none */
+}
 
 static void
-rb_encoder_free( void* _ptr)
+rb_encoder_free(void* _ptr)
 {
   jpeg_encode_t* ptr;
 
@@ -411,10 +424,56 @@ rb_encoder_free( void* _ptr)
   if (ptr->array != NULL) xfree(ptr->array);
   if (ptr->rows != NULL) xfree(ptr->rows);
 
-  jpeg_destroy_compress(&ptr->cinfo);
+  if (TEST_FLAG(ptr, F_CREATE)) {
+    jpeg_destroy_compress(&ptr->cinfo);
+  }
 
   free(_ptr);
 }
+
+static size_t
+rb_encoder_size(const void* _ptr)
+{
+  size_t ret;
+  jpeg_encode_t* ptr;
+
+  ptr  = (jpeg_encode_t*)_ptr;
+
+  ret  = sizeof(jpeg_encode_t);
+  ret += sizeof(JSAMPROW) * UNIT_LINES; 
+  ret += sizeof(JSAMPLE) * ptr->stride * UNIT_LINES;
+
+  return ret;
+}
+
+#if RUBY_API_VERSION_CODE > 20600
+static const rb_data_type_t jpeg_encoder_data_type = {
+  "libjpeg-ruby encoder object",     // wrap_struct_name
+  {
+    rb_encoder_mark,                 // function.dmark
+    rb_encoder_free,                 // function.dfree
+    rb_encoder_size,                 // function.dsize
+    NULL,                            // function.dcompact
+    {NULL},                          // function.reserved
+  },                                
+  NULL,                              // parent
+  NULL,                              // data
+  (VALUE)RUBY_TYPED_FREE_IMMEDIATELY // flags
+};
+#else /* RUBY_API_VERSION_CODE > 20600 */
+static const rb_data_type_t jpeg_encoder_data_type = {
+  "libjpeg-ruby encoder object",     // wrap_struct_name
+  {
+    rb_encoder_mark,                 // function.dmark
+    rb_encoder_free,                 // function.dfree
+    rb_encoder_size,                 // function.dsize
+    {NULL, NULL},                    // function.reserved
+  },                                
+  NULL,                              // parent
+  NULL,                              // data
+  (VALUE)RUBY_TYPED_FREE_IMMEDIATELY // flags
+};
+#endif /* RUBY_API_VERSION_CODE > 20600 */
 
 static VALUE
 rb_encoder_alloc(VALUE self)
@@ -424,7 +483,7 @@ rb_encoder_alloc(VALUE self)
   ptr = ALLOC(jpeg_encode_t);
   memset(ptr, 0, sizeof(*ptr));
 
-  return Data_Wrap_Struct(encoder_klass, 0, rb_encoder_free, ptr);
+  return TypedData_Wrap_Struct(encoder_klass, &jpeg_encoder_data_type, ptr);
 }
 
 static void
@@ -485,13 +544,11 @@ set_encoder_context(jpeg_encode_t* ptr, int wd, int ht, VALUE opt)
     components  = 4;
     data_size   = (wd * ht * 4);
 
-
   } else if (EQ_STR(opts[0], "BGRX") || EQ_STR(opts[0], "BGR32")) {
     format      = FMT_BGR32;
     color_space = JCS_EXT_BGRX;
     components  = 4;
     data_size   = (wd * ht * 4);
-
 
   } else if (EQ_STR(opts[0], "GRAYSCALE")) {
     format      = FMT_GRAYSCALE;
@@ -605,7 +662,6 @@ set_encoder_context(jpeg_encode_t* ptr, int wd, int ht, VALUE opt)
     ARGUMENT_ERROR("Unsupportd :stride option value.");
   }
 
-
   /*
    * set context
    */
@@ -622,7 +678,9 @@ set_encoder_context(jpeg_encode_t* ptr, int wd, int ht, VALUE opt)
   }
 
   jpeg_create_compress(&ptr->cinfo);
+  SET_FLAG(ptr, F_CREATE);
 
+  ptr->cinfo.client_data      = (void*)ptr;
   ptr->cinfo.err              = jpeg_std_error(&ptr->jerr);
   ptr->jerr.output_message    = encode_output_message;
   ptr->jerr.error_exit        = encode_error_exit;
@@ -675,7 +733,7 @@ rb_encoder_initialize(int argc, VALUE *argv, VALUE self)
   /*
    * initialize
    */
-  Data_Get_Struct(self, jpeg_encode_t, ptr);
+  TypedData_Get_Struct(self, jpeg_encode_t, &jpeg_encoder_data_type, ptr);
 
   /*
    * parse arguments
@@ -751,8 +809,6 @@ push_rows_comp4(JSAMPROW rows, int wd, uint8_t* data, int nrow)
   memcpy(rows, data, size);
 }
 
-
-
 static void
 push_rows_grayscale(JSAMPROW rows, int wd, uint8_t* data, int nrow)
 {
@@ -765,8 +821,6 @@ push_rows_grayscale(JSAMPROW rows, int wd, uint8_t* data, int nrow)
 static void
 push_rows(jpeg_encode_t* ptr, uint8_t* data, int nrow)
 {
-  int ret;
-
   switch (ptr->format) {
   case FMT_YUV422:
     push_rows_yuv422(ptr->rows, ptr->width, data, nrow);
@@ -889,7 +943,7 @@ rb_encoder_encode(VALUE self, VALUE data)
   /*
    * initialize
    */
-  Data_Get_Struct(self, jpeg_encode_t, ptr);
+  TypedData_Get_Struct(self, jpeg_encode_t, &jpeg_encoder_data_type, ptr);
 
   /*
    * argument check
@@ -913,13 +967,6 @@ rb_encoder_encode(VALUE self, VALUE data)
 }
 
 static void
-rb_decoder_free(void* ptr)
-{
-  //jpeg_destroy_decompress(&(((jpeg_decode_t*)ptr)->cinfo));
-  free(ptr);
-}
-
-static void
 rb_decoder_mark(void* _ptr)
 {
   jpeg_decode_t* ptr;
@@ -930,6 +977,59 @@ rb_decoder_mark(void* _ptr)
     rb_gc_mark(ptr->orientation.buf);
   }
 }
+
+static void
+rb_decoder_free(void* _ptr)
+{
+  jpeg_decode_t* ptr;
+
+  ptr = (jpeg_decode_t*)_ptr;
+
+  if (TEST_FLAG(ptr, F_CREATE)) {
+    jpeg_destroy_decompress(&ptr->cinfo);
+  }
+
+  free(ptr);
+}
+
+static size_t
+rb_decoder_size(const void* ptr)
+{
+  size_t ret;
+
+  ret  = sizeof(jpeg_decode_t);
+
+  return ret;
+}
+
+#if RUBY_API_VERSION_CODE > 20600
+static const rb_data_type_t jpeg_decoder_data_type = {
+  "libjpeg-ruby decoder object",     // wrap_struct_name
+  {                                 
+    rb_decoder_mark,                 // function.dmark
+    rb_decoder_free,                 // function.dfree
+    rb_decoder_size,                 // function.dsize
+    NULL,                            // function.dcompact
+    {NULL},                          // function.reserved
+  },                                
+  NULL,                              // parent
+  NULL,                              // data
+  (VALUE)RUBY_TYPED_FREE_IMMEDIATELY // flags
+};
+#else /* RUBY_API_VERSION_CODE > 20600 */
+static const rb_data_type_t jpeg_decoder_data_type = {
+  "libjpeg-ruby decoder object",     // wrap_struct_name
+  {                                 
+    rb_decoder_mark,                 // function.dmark
+    rb_decoder_free,                 // function.dfree
+    rb_decoder_size,                 // function.dsize
+    {NULL, NULL},                    // function.reserved
+  },                                
+  NULL,                              // parent
+  NULL,                              // data
+  (VALUE)RUBY_TYPED_FREE_IMMEDIATELY // flags
+};
+#endif /* RUBY_API_VERSION_CODE > 20600 */
 
 static void
 decode_output_message(j_common_ptr cinfo)
@@ -1005,7 +1105,7 @@ rb_decoder_alloc(VALUE self)
   ptr->orientation.value        = 0;
   ptr->orientation.buf          = Qnil;
 
-  return Data_Wrap_Struct(decoder_klass, rb_decoder_mark, rb_decoder_free, ptr);
+  return TypedData_Wrap_Struct(decoder_klass, &jpeg_decoder_data_type, ptr);
 }
 
 static void
@@ -1396,7 +1496,7 @@ rb_decoder_initialize( int argc, VALUE *argv, VALUE self)
   /*
    * initialize
    */
-  Data_Get_Struct(self, jpeg_decode_t, ptr);
+  TypedData_Get_Struct(self, jpeg_decode_t, &jpeg_decoder_data_type, ptr);
 
   /*
    * parse arguments
@@ -1421,7 +1521,7 @@ rb_decoder_set(VALUE self, VALUE opt)
   /*
    * initialize
    */
-  Data_Get_Struct(self, jpeg_decode_t, ptr);
+  TypedData_Get_Struct(self, jpeg_decode_t, &jpeg_decoder_data_type, ptr);
 
   /*
    * check argument
@@ -2326,7 +2426,10 @@ do_read_header(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
 
   if (setjmp(ptr->err_mgr.jmpbuf)) {
     jpeg_destroy_decompress(&ptr->cinfo);
+    CLR_FLAG(ptr, F_CREATE);
+
     rb_raise(decerr_klass, "%s", ptr->err_mgr.msg);
+
   } else {
     jpeg_mem_src(&ptr->cinfo, jpg, jpg_sz);
 
@@ -2344,6 +2447,7 @@ do_read_header(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
     ret = create_meta(ptr);
 
     jpeg_destroy_decompress(&ptr->cinfo);
+    CLR_FLAG(ptr, F_CREATE);
   }
 
   return ret;
@@ -2367,7 +2471,7 @@ rb_decoder_read_header(VALUE self, VALUE data)
   /*
    * initialize
    */
-  Data_Get_Struct(self, jpeg_decode_t, ptr);
+  TypedData_Get_Struct(self, jpeg_decode_t, &jpeg_decoder_data_type, ptr);
 
   /*
    * argument check
@@ -2899,7 +3003,9 @@ do_decode(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
   case FMT_RGB32:
   case FMT_BGR32:
     jpeg_create_decompress(cinfo);
+    SET_FLAG(ptr, F_CREATE);
 
+    cinfo->client_data               = (void*)ptr;
     cinfo->err                       = jpeg_std_error(&ptr->err_mgr.jerr);
     ptr->err_mgr.jerr.output_message = decode_output_message;
     ptr->err_mgr.jerr.emit_message   = decode_emit_message;
@@ -2908,6 +3014,7 @@ do_decode(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
     if (setjmp(ptr->err_mgr.jmpbuf)) {
       jpeg_abort_decompress(cinfo);
       jpeg_destroy_decompress(&ptr->cinfo);
+      CLR_FLAG(ptr, F_CREATE);
 
       free(array);
       rb_raise(decerr_klass, "%s", ptr->err_mgr.msg);
@@ -2972,6 +3079,7 @@ do_decode(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
 
       jpeg_finish_decompress(cinfo);
       jpeg_destroy_decompress(&ptr->cinfo);
+      CLR_FLAG(ptr, F_CREATE);
     }
     break;
   }
@@ -2993,25 +3101,25 @@ do_decode(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
 static VALUE
 rb_decoder_decode(VALUE self, VALUE data)
 {
-    VALUE ret;
-    jpeg_decode_t* ptr;
+  VALUE ret;
+  jpeg_decode_t* ptr;
 
-    /*
-     * initialize
-     */
-    Data_Get_Struct(self, jpeg_decode_t, ptr);
+  /*
+   * initialize
+   */
+  TypedData_Get_Struct(self, jpeg_decode_t, &jpeg_decoder_data_type, ptr);
 
-    /*
-     * argument check
-     */
-    Check_Type(data, T_STRING);
+  /*
+   * argument check
+   */
+  Check_Type(data, T_STRING);
 
-    /*
-     * do encode
-     */
-    ret = do_decode(ptr, (uint8_t*)RSTRING_PTR(data), RSTRING_LEN(data));
+  /*
+   * do encode
+   */
+  ret = do_decode(ptr, (uint8_t*)RSTRING_PTR(data), RSTRING_LEN(data));
 
-    return ret;
+  return ret;
 }
 
 static VALUE
