@@ -288,4 +288,53 @@ class TestSimple < Test::Unit::TestCase
     assert_true(dat.bytesize < img.bytesize)
     # IO.binwrite("output.png", dat)
   end
+
+  test "large image" do
+    raw = "".b
+
+    r = ([255, 0, 0] * 2048).pack("C*")
+    g = ([0, 255, 0] * 2048).pack("C*")
+    b = ([0, 0, 255] * 2048).pack("C*")
+
+    i = 0
+    loop {
+      case i % 24
+      when (0..7)
+        raw += r 
+
+      when (8..15)
+        raw += g 
+
+      when (16..23)
+        raw += b 
+      end
+
+      i += 1
+      break if i >= 1536
+    }
+
+    jpg = assert_nothing_raised {
+      enc = JPEG::Encoder.new(2048, 1536, :pixel_format => :RGB)
+      enc << raw
+    }
+
+    assert_true(jpg.bytesize > 4096) # check for issue#7
+    # IO.binwrite("afo.jpg", jpg)
+
+    raw = assert_nothing_raised {
+      dec = JPEG::Decoder.new(:pixel_format => :RGB)
+      dec << jpg
+    }
+
+    assert_true(raw.bytesize == 2048 * 1536 * 3)
+    # IO.binwrite("afo.ppm", "P6\n#test\n2048 1536\n255\n".b + raw)
+
+    raw = assert_nothing_raised {
+      dec = JPEG::Decoder.new(:pixel_format => :GRAYSCALE)
+      dec << jpg
+    }
+
+    assert_true(raw.bytesize == 2048 * 1536)
+    IO.binwrite("afo.pgm", "P5\n#test\n2048 1536\n255\n".b + raw)
+  end
 end
