@@ -33,7 +33,6 @@
 #define F_APPLY_ORIENTATION        0x00000008
 #define F_DITHER                   0x00000010
 #define F_CREAT                    0x00010000
-#define F_START                    0x00020000
 
 #define SET_FLAG(ptr, msk)         ((ptr)->flags |= (msk))
 #define CLR_FLAG(ptr, msk)         ((ptr)->flags &= ~(msk))
@@ -69,8 +68,8 @@
 #define IS_COLORMAPPED(ci)         (((ci)->actual_number_of_colors > 0) &&\
                                     ((ci)->colormap != NULL) && \
                                     ((ci)->output_components == 1) && \
-                                       (((ci)->out_color_components == 1) || \
-                                        ((ci)->out_color_components == 3)))
+                                    (((ci)->out_color_components == 1) || \
+                                     ((ci)->out_color_components == 3)))
 
 #define ALLOC_ARRAY() \
         ((JSAMPARRAY)malloc(sizeof(JSAMPROW) * UNIT_LINES))
@@ -1217,6 +1216,7 @@ do_encode(VALUE _ptr)
     /*
      * when error occurred
      */
+    jpeg_abort_compress(&ptr->cinfo);
     rb_raise(encerr_klass, "%s", ptr->err_mgr.msg);
 
   } else {
@@ -1224,7 +1224,6 @@ do_encode(VALUE _ptr)
      * normal path
      */
     jpeg_start_compress(&ptr->cinfo, TRUE);
-    SET_FLAG(ptr, F_START);
 
     if (ptr->orientation != 0) {
       put_exif_tags(ptr);
@@ -1239,6 +1238,8 @@ do_encode(VALUE _ptr)
       jpeg_write_scanlines(&ptr->cinfo, ptr->array, nrow);
       data += (ptr->stride * nrow);
     }
+
+    jpeg_finish_compress(&ptr->cinfo);
 
     /*
      * build return data
@@ -1310,11 +1311,6 @@ rb_encoder_encode(VALUE self, VALUE data)
   /*
    * post process
    */
-  if (TEST_FLAG(ptr, F_START)) {
-    jpeg_finish_compress(&ptr->cinfo);
-    CLR_FLAG(ptr, F_START);
-  }
-
   CLR_DATA(ptr);
 
   if (ptr->buf.mem != NULL) {
@@ -3548,11 +3544,12 @@ do_decode(VALUE _ptr)
     /*
      * when error occurred
      */
+    jpeg_abort_decompress(&ptr->cinfo);
     rb_raise(decerr_klass, "%s", ptr->err_mgr.msg);
 
   } else {
     /*
-     * normal path
+     * initialize
      */
     jpeg_mem_src(cinfo, data, size);
 
@@ -3563,6 +3560,9 @@ do_decode(VALUE _ptr)
     jpeg_read_header(cinfo, TRUE);
     jpeg_calc_output_dimensions(cinfo);
 
+    /*
+     * configuration
+     */
     cinfo->raw_data_out             = FALSE;
     cinfo->dct_method               = ptr->dct_method;
            
@@ -3581,8 +3581,10 @@ do_decode(VALUE _ptr)
     cinfo->enable_external_quant    = ptr->enable_external_quant;
     cinfo->enable_2pass_quant       = ptr->enable_2pass_quant;
 
+    /*
+     * decode process
+     */
     jpeg_start_decompress(cinfo);
-    SET_FLAG(ptr, F_START);
 
     stride = cinfo->output_components * cinfo->output_width;
     raw_sz = stride * cinfo->output_height;
@@ -3597,6 +3599,11 @@ do_decode(VALUE _ptr)
       jpeg_read_scanlines(cinfo, array, UNIT_LINES);
     }
 
+    jpeg_finish_decompress(&ptr->cinfo);
+
+    /*
+     * build return data
+     */
     if (TEST_FLAG(ptr, F_EXPAND_COLORMAP) && IS_COLORMAPPED(cinfo)) {
       ret = expand_colormap(cinfo, raw);
     } else {
@@ -3658,16 +3665,6 @@ rb_decoder_decode(VALUE self, VALUE data)
   /*
    * post process
    */
-  if (TEST_FLAG(ptr, F_START)) {
-    if (state == 0) {
-      jpeg_finish_decompress(&ptr->cinfo);
-    } else {
-      jpeg_abort_decompress(&ptr->cinfo);
-    }
-
-    CLR_FLAG(ptr, F_START);
-  }
-
   CLR_DATA(ptr);
 
   if (state != 0) rb_jump_tag(state);
