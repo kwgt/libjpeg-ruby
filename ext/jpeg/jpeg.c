@@ -2129,7 +2129,7 @@ get_colorspace_str( J_COLOR_SPACE cs)
     break;
   }
 
-  return rb_str_new_cstr(cstr);
+  return rb_str_freeze(rb_str_new_cstr(cstr));
 }
 
 typedef struct {
@@ -2325,6 +2325,8 @@ exif_fetch_byte_data(exif_t* ptr, VALUE* dst)
     for (i = 0; i < (int)n; i++) {
       rb_ary_push(obj, INT2FIX(p[i]));
     }
+
+    rb_ary_freeze(obj);
     break;
   }
 
@@ -2348,6 +2350,7 @@ exif_fetch_ascii_data(exif_t* ptr, VALUE* dst)
 
   obj = rb_utf8_str_new((char*)p, n);
   rb_funcall(obj, rb_intern("strip!"), 0);
+  rb_str_freeze(obj);
 
   *dst = obj;
 }
@@ -2382,6 +2385,8 @@ exif_fetch_short_data(exif_t* ptr, VALUE* dst)
       rb_ary_push(obj, INT2FIX(get_u16(p, ptr->be)));
       p += 2;
     }
+
+    rb_ary_freeze(obj);
     break;
   }
 
@@ -2416,6 +2421,8 @@ exif_fetch_long_data(exif_t* ptr, VALUE* dst)
       rb_ary_push(obj, INT2FIX(get_u32(p, ptr->be)));
       p += 4;
     }
+
+    rb_ary_freeze(obj);
     break;
   }
 
@@ -2426,6 +2433,7 @@ static void
 exif_fetch_rational_data(exif_t* ptr, VALUE* dst)
 {
   VALUE obj;
+  VALUE val;
 
   int i;
   uint32_t n;
@@ -2448,6 +2456,7 @@ exif_fetch_rational_data(exif_t* ptr, VALUE* dst)
       deno = 1;
     }
     obj = rb_rational_new(INT2FIX(num), INT2FIX(deno));
+    rb_obj_freeze(obj);
     break;
 
   default:
@@ -2458,9 +2467,15 @@ exif_fetch_rational_data(exif_t* ptr, VALUE* dst)
       if (num == 0 && deno == 0) {
         deno = 1;
       }
-      rb_ary_push(obj, rb_rational_new(INT2FIX(num), INT2FIX(deno)));
+
+      val = rb_rational_new(INT2FIX(num), INT2FIX(deno));
+      rb_obj_freeze(val);
+
+      rb_ary_push(obj, val);
       p += 8;
     }
+
+    rb_ary_freeze(obj);
     break;
   }
 
@@ -2483,6 +2498,7 @@ exif_fetch_undefined_data(exif_t* ptr, VALUE* dst)
   }
 
   obj = rb_enc_str_new((char*)p, n, rb_ascii8bit_encoding());
+  rb_str_freeze(obj);
 
   *dst = obj;
 }
@@ -2515,6 +2531,8 @@ exif_fetch_slong_data(exif_t* ptr, VALUE* dst)
       rb_ary_push(obj, INT2FIX(get_s32(p, ptr->be)));
       p += 4;
     }
+
+    rb_ary_freeze(obj);
     break;
   }
 
@@ -2525,6 +2543,7 @@ static void
 exif_fetch_srational_data(exif_t* ptr, VALUE* dst)
 {
   VALUE obj;
+  VALUE val;
 
   int i;
   uint32_t n;
@@ -2557,9 +2576,15 @@ exif_fetch_srational_data(exif_t* ptr, VALUE* dst)
       if (num == 0 && deno == 0) {
         deno = 1;
       }
-      rb_ary_push(obj, rb_rational_new(INT2FIX(num), INT2FIX(deno)));
+
+      val = rb_rational_new(INT2FIX(num), INT2FIX(deno));
+      rb_obj_freeze(val);
+
+      rb_ary_push(obj, val);
       p += 8;
     }
+
+    rb_ary_freeze(obj);
     break;
   }
 
@@ -2720,7 +2745,10 @@ create_exif_tags_hash(jpeg_decode_t* ptr)
 
       if (TYPE(off) == T_FIXNUM && TYPE(size) == T_FIXNUM) {
         data = rb_enc_str_new((char*)exif.head + FIX2INT(off),
-                              FIX2INT(size), rb_ascii8bit_encoding());
+                              FIX2INT(size),
+                              rb_ascii8bit_encoding());
+
+        rb_str_freeze(data);
 
         rb_hash_lookup(info, THUMBNAIL_OFFSET);
         rb_hash_lookup(info, THUMBNAIL_SIZE);
@@ -2730,6 +2758,8 @@ create_exif_tags_hash(jpeg_decode_t* ptr)
     }
     break;
   }
+
+  rb_hash_freeze(ret);
 
   return ret;
 }
@@ -2861,6 +2891,8 @@ create_colormap(jpeg_decode_t* ptr)
     RUNTIME_ERROR("this number of components is not implemented yet");
   }
 
+  rb_ary_freeze(ret);
+
   return ret;
 }
 
@@ -2899,7 +2931,7 @@ create_meta(jpeg_decode_t* ptr)
   rb_ivar_set(ret, id_orig_cs, get_colorspace_str(cinfo->jpeg_color_space));
 
   if (ptr->format == FMT_YVU) {
-    rb_ivar_set(ret, id_out_cs, rb_str_new_cstr("YCrCb"));
+    rb_ivar_set(ret, id_out_cs, rb_str_freeze(rb_str_new_cstr("YCrCb")));
   } else {
     rb_ivar_set(ret, id_out_cs, get_colorspace_str(cinfo->out_color_space));
   }
@@ -2919,6 +2951,8 @@ create_meta(jpeg_decode_t* ptr)
   if (TEST_FLAG(ptr, F_DITHER)) {
     rb_ivar_set(ret, id_colormap, create_colormap(ptr));
   }
+
+  rb_obj_freeze(ret);
   
   return ret;
 }
@@ -3700,6 +3734,10 @@ void
 Init_jpeg()
 {
   int i;
+
+#ifdef HAVE_RB_EXT_RACTOR_SAFE
+  rb_ext_ractor_safe(true);
+#endif /* defined(HAVE_RB_EXT_RACTOR_SAFE) */
 
   module = rb_define_module("JPEG");
   rb_define_singleton_method(module, "broken?", rb_test_image, 1);
